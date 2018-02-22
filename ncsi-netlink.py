@@ -5,7 +5,7 @@ import socket
 import argparse
 
 
-from libnl.attr import nla_data, nla_parse, nla_for_each_nested, nla_get_string, nla_get_u16, nla_get_u32, NLA_NESTED, nla_parse_nested, nla_policy, nla_put_string, NLA_STRING, NLA_U16, NLA_U32, NLA_FLAG, nla_for_each_attr, nla_type, nla_is_nested, nla_get_flag, nla_put_u32
+from libnl.attr import nla_data, nla_parse, nla_for_each_nested, nla_get_string, nla_get_u16, nla_get_u32, NLA_NESTED, nla_parse_nested, nla_policy, nla_put_string, NLA_STRING, NLA_U16, NLA_U32, NLA_FLAG, nla_for_each_attr, nla_type, nla_is_nested, nla_get_flag, nla_put_u32, nla_len, nla_ok, nlattr, nla_next
 from libnl.error import errmsg
 from libnl.genl.genl import genl_connect, genlmsg_attrdata, genlmsg_attrlen, genlmsg_put, genlmsg_parse
 from libnl.genl.ctrl import genl_ctrl_resolve
@@ -19,8 +19,9 @@ from libnl.misc import c_int
 
 # NCSI Netlink commands and attributes - see include/uapi/linux/ncsi.h
 NCSI_CMD_UNSPEC = 0
-NCSI_CMD_SET_INTERFACE = 1
-NCSI_CMD_PKG_INFO = 2
+NCSI_CMD_PKG_INFO = 1
+NCSI_CMD_SET_INTERFACE = 2
+NCSI_CMD_CLEAR_INTERFACE = 3
 
 NCSI_ATTR_UNSPEC = 0
 NCSI_ATTR_IFINDEX = 1
@@ -32,8 +33,9 @@ NCSI_ATTR_MAX = 5
 NCSI_PKG_UNSPEC = 0
 NCSI_PKG_ATTR = 1
 NCSI_PKG_ATTR_ID = 2
-NCSI_PKG_ATTR_CHANNEL_LIST = 3
-NCSI_PKG_ATTR_MAX = 4
+NCSI_PKG_ATTR_FORCED = 3
+NCSI_PKG_ATTR_CHANNEL_LIST = 4
+NCSI_PKG_ATTR_MAX = 5
 
 NCSI_CHANNEL_ATTR_UNSPEC = 0
 NCSI_CHANNEL_ATTR = 1
@@ -43,8 +45,10 @@ NCSI_CHANNEL_ATTR_VERSION_MINOR = 4
 NCSI_CHANNEL_ATTR_VERSION_STR = 5
 NCSI_CHANNEL_ATTR_LINK_STATE = 6
 NCSI_CHANNEL_ATTR_ACTIVE = 7
-NCSI_CHANNEL_ATTR_VLAN_LIST = 8
-NCSI_CHANNEL_ATTR_MAX = 9
+NCSI_CHANNEL_ATTR_FORCED = 8
+NCSI_CHANNEL_ATTR_VLAN_LIST = 9
+NCSI_CHANNEL_ATTR_VLAN_ID = 10
+NCSI_CHANNEL_ATTR_MAX = 11
 
 NCSI_VLAN_UNSPEC = 0
 NCSI_VLAN_INFO = 1
@@ -65,6 +69,7 @@ ncsi_package_policy = dict((i, None) for i in range(NCSI_PKG_ATTR_MAX))
 ncsi_package_policy.update({
     NCSI_PKG_ATTR: nla_policy(type_=NLA_NESTED),
     NCSI_PKG_ATTR_ID: nla_policy(type_=NLA_U32),
+    NCSI_PKG_ATTR_FORCED: nla_policy(type_=NLA_FLAG),
     NCSI_PKG_ATTR_CHANNEL_LIST: nla_policy(type_=NLA_NESTED),
 })
 
@@ -77,7 +82,9 @@ ncsi_channel_policy.update({
     NCSI_CHANNEL_ATTR_VERSION_STR: nla_policy(type_=NLA_STRING),
     NCSI_CHANNEL_ATTR_LINK_STATE: nla_policy(type_=NLA_U32),
     NCSI_CHANNEL_ATTR_ACTIVE: nla_policy(type_=NLA_FLAG),
+    NCSI_CHANNEL_ATTR_FORCED: nla_policy(type_=NLA_FLAG),
     NCSI_CHANNEL_ATTR_VLAN_LIST: nla_policy(type_=NLA_NESTED),
+    NCSI_CHANNEL_ATTR_VLAN_ID: nla_policy(type_=NLA_U16),
 })
 
 ncsi_vlan_policy = dict((i, None) for i in range(NCSI_VLAN_INFO_MAX))
@@ -123,9 +130,11 @@ def info_callback(msg, _):
             return ret
         if NCSI_PKG_ATTR_ID in ptb:
             print('package {}'.format(nla_get_u32(ptb[NCSI_PKG_ATTR_ID])))
-            print('----------')
         else:
             print('package (with no id?)')
+        if NCSI_PKG_ATTR_FORCED in ptb:
+            print('this package is forced')
+        print('----------')
 
         crem = c_int()
         for cnla in nla_for_each_nested(ptb[NCSI_PKG_ATTR_CHANNEL_LIST], crem):
@@ -140,6 +149,8 @@ def info_callback(msg, _):
                     print('channel {} - active!'.format(channel))
                 else:
                     print('channel {}'.format(channel))
+                if NCSI_CHANNEL_ATTR_FORCED in ctb:
+                    print('\tthis channel is forced')
             else:
                 print('channel (with no id?)')
             if NCSI_CHANNEL_ATTR_VERSION_MAJOR in ctb:
@@ -153,16 +164,12 @@ def info_callback(msg, _):
             if NCSI_CHANNEL_ATTR_VLAN_LIST in ctb:
                 print('\tactive vlan ids:')
                 rrem = c_int()
-                for vnla in nla_for_each_nested(ctb[NCSI_CHANNEL_ATTR_VLAN_LIST], rrem):
-                    vtb = dict()
-                    vret = nla_parse_nested(vtb, NCSI_VLAN_INFO_MAX, vnla, ncsi_vlan_policy)
-                    if vret < 0:
-                        print('\t\tfailed to parse vlan ids')
-                    else:
-                        if NCSI_VLAN_INFO_ID in vtb:
-                            print('\t\t{}'.format(nla_get_u16(vtb[NCSI_VLAN_INFO_ID])))
-                        else:
-                            print('\t\tno id?')
+                vids = ctb[NCSI_CHANNEL_ATTR_VLAN_LIST]
+                vid = nlattr(nla_data(vids))
+                rrem.value = nla_len(vids)
+                while nla_ok(vid, rrem):
+                    print('\t\t{}'.format(nla_get_u16(vid)))
+                    vid = nla_next(vid, rrem)
 
     return NL_SKIP
 
@@ -172,7 +179,7 @@ Send an NCSI_CMD_SET_INTERFACE command. We can set either;
     - A single package and a single channel on that package (ie. a
       particular port)
 If neither package or channel ID are specified any previously set interface
-is cleared.
+is cleared via NCSI_CMD_CLEAR_INTERFACE.
 '''
 def ncsi_set_interface(ifindex, package, channel):
 
@@ -186,12 +193,14 @@ def ncsi_set_interface(ifindex, package, channel):
         return driver_id
 
     msg = nlmsg_alloc()
-    genlmsg_put(msg, 0, 0, driver_id, 0, 0, NCSI_CMD_SET_INTERFACE, 0)
-    ret = nla_put_u32(msg, NCSI_ATTR_IFINDEX, ifindex)
-    if package:
+    if package or package and channel:
+        genlmsg_put(msg, 0, 0, driver_id, 0, 0, NCSI_CMD_SET_INTERFACE, 0)
         ret = nla_put_u32(msg, NCSI_ATTR_PACKAGE_ID, int(package))
-    if channel:
-        ret = nla_put_u32(msg, NCSI_ATTR_CHANNEL_ID, int(channel))
+        if channel:
+            ret = nla_put_u32(msg, NCSI_ATTR_CHANNEL_ID, int(channel))
+    else:
+        genlmsg_put(msg, 0, 0, driver_id, 0, 0, NCSI_CMD_CLEAR_INTERFACE, 0)
+    ret = nla_put_u32(msg, NCSI_ATTR_IFINDEX, ifindex)
 
     nl_socket_modify_cb(sk, NL_CB_VALID, NL_CB_CUSTOM, dump_callback, None)
 
