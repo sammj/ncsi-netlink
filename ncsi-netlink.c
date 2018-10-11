@@ -308,6 +308,123 @@ out:
 	return rc;
 }
 
+static int run_command_package_mask(int ifindex, uint32_t mask, bool multi_mode)
+{
+	struct ncsi_msg msg;
+	int rc;
+
+	rc = setup_ncsi_message(&msg, NCSI_CMD_SET_PACKAGE_MASK, 0);
+	if (rc)
+		return -1;
+
+	printf("package-mask cmd, ifindex %d, mask 0x%x%s\n",
+			ifindex, mask,
+			multi_mode ? ", multi-mode enabled" : "");
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_IFINDEX, ifindex);
+	if (rc) {
+		fprintf(stderr, "Failed to add ifindex, %m\n");
+		goto out;
+	}
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_PACKAGE_MASK, mask);
+	if (rc) {
+		fprintf(stderr, "Failed to add package mask, %m\n");
+		goto out;
+	}
+
+	if (multi_mode) {
+		rc = nla_put_flag(msg.msg, NCSI_ATTR_MULTI_FLAG);
+		if (rc) {
+			fprintf(stderr, "Failed to add multi flag, %m\n");
+			goto out;
+		}
+	}
+
+	rc = nl_send_auto(msg.sk, msg.msg);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to send message, %m\n");
+		goto out;
+	}
+
+	rc = nl_recvmsgs_default(msg.sk);
+	if (rc) {
+		fprintf(stderr, "Failed to receive message, %m\n");
+		goto out;
+	}
+
+out:
+	free_ncsi_msg(&msg);
+	return rc;
+}
+
+static int run_command_channel_mask(int ifindex, int package, uint32_t mask,
+		bool multi_mode, int channel)
+{
+	struct ncsi_msg msg;
+	int rc;
+
+	rc = setup_ncsi_message(&msg, NCSI_CMD_SET_CHANNEL_MASK, 0);
+	if (rc)
+		return -1;
+
+	printf("channel-mask cmd, ifindex %d, package 0x%x, mask 0x%x%s\n",
+			ifindex, package, mask,
+			multi_mode ? ", multi-mode enabled" : "");
+	if (channel >= 0)
+		printf("Preferred channel 0x%x\n", channel);
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_IFINDEX, ifindex);
+	if (rc) {
+		fprintf(stderr, "Failed to add ifindex, %m\n");
+		goto out;
+	}
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_PACKAGE_ID, package);
+	if (rc) {
+		fprintf(stderr, "Failed to add package, %m\n");
+		goto out;
+	}
+
+	if (multi_mode) {
+		rc = nla_put_flag(msg.msg, NCSI_ATTR_MULTI_FLAG);
+		if (rc) {
+			fprintf(stderr, "Failed to add multi flag, %m\n");
+			goto out;
+		}
+	}
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_CHANNEL_MASK, mask);
+	if (rc) {
+		fprintf(stderr, "Failed to add channel mask, %m\n");
+		goto out;
+	}
+
+	if (channel >= 0) {
+		rc = nla_put_u32(msg.msg, NCSI_ATTR_CHANNEL_ID, channel);
+		if (rc) {
+			fprintf(stderr, "Failed to add channel id, %m\n");
+			goto out;
+		}
+	}
+
+	rc = nl_send_auto(msg.sk, msg.msg);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to send message, %m\n");
+		goto out;
+	}
+
+	rc = nl_recvmsgs_default(msg.sk);
+	if (rc) {
+		fprintf(stderr, "Failed to receive message, %m\n");
+		goto out;
+	}
+
+out:
+	free_ncsi_msg(&msg);
+	return rc;
+}
+
 void usage(void)
 {
 	printf(	"ncsi-netlink: Send messages to the NCSI driver via Netlink\n"
@@ -318,6 +435,9 @@ void usage(void)
 		"\t--info               Display info for packages and channels\n"
 		"\t--set                Force the usage of a certain package/channel combination\n"
 		"\t--clear              Clear the above setting\n"
+		"\t--multi              Set multi-mode with a mask command\n"
+		"\t--package-mask mask  Set the allowed package mask\n"
+		"\t--channel-mask mask  Set the allowed channel mask\n"
 		"\t--help               Print this help text\n"
 		"\n"
 	      );
@@ -327,20 +447,26 @@ int main(int argc, char *argv[])
 {
 	int rc, operation = -1;
 	int package, channel, ifindex;
+	uint32_t package_mask, channel_mask;
+	bool multi_mode;
 
 	static const struct option long_opts[] = {
 		{"channel",	required_argument, 	NULL, 'c'},
 		{"help",	no_argument,		NULL, 'h'},
 		{"info",	no_argument, 		NULL, 'i'},
 		{"ifindex",	required_argument, 	NULL, 'l'},
+		{"multi",	no_argument,	 	NULL, 'm'},
 		{"package",	required_argument, 	NULL, 'p'},
 		{"set",		no_argument, 		NULL, 's'},
 		{"clear",	no_argument, 		NULL, 'x'},
+		{"package-mask",required_argument,	NULL, 'y'},
+		{"channel-mask",required_argument,	NULL, 'z'},
 		{ NULL, 0, NULL, 0},
 	};
-	static const char short_opts[] = "c:hil:p:sx";
+	static const char short_opts[] = "c:hil:mp:sxy:z:";
 
 	package = channel = ifindex = -1;
+	multi_mode = false;
 
 	while (true) {
 		int c = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -367,6 +493,9 @@ int main(int argc, char *argv[])
 				return -1;
 			}
 			break;
+		case 'm':
+			multi_mode = true;
+			break;
 		case 'p':
 			package = strtoul(optarg, NULL, 0);
 			if (errno) {
@@ -379,6 +508,22 @@ int main(int argc, char *argv[])
 			break;
 		case 'x':
 			operation = NCSI_CMD_CLEAR_INTERFACE;
+			break;
+		case 'y':
+			operation = NCSI_CMD_SET_PACKAGE_MASK;
+			package_mask = strtoul(optarg, NULL, 0);
+			if (errno) {
+				fprintf(stderr, "Couldn't parse package mask, %m\n");
+				return -1;
+			}
+			break;
+		case 'z':
+			operation = NCSI_CMD_SET_CHANNEL_MASK;
+			channel_mask = strtoul(optarg, NULL, 0);
+			if (errno) {
+				fprintf(stderr, "Couldn't channel mask, %m\n");
+				return -1;
+			}
 			break;
 		case 'h':
 			usage();
@@ -407,6 +552,18 @@ int main(int argc, char *argv[])
 		break;
 	case NCSI_CMD_CLEAR_INTERFACE:
 		rc = run_command_clear(ifindex);
+		break;
+	case NCSI_CMD_SET_PACKAGE_MASK:
+		rc = run_command_package_mask(ifindex, package_mask,
+				multi_mode);
+		break;
+	case NCSI_CMD_SET_CHANNEL_MASK:
+		if (package < 0) {
+			fprintf(stderr, "Must specifiy parent package\n");
+			return -1;
+		}
+		rc = run_command_channel_mask(ifindex, package, channel_mask,
+				multi_mode, channel);
 		break;
 	default:
 		usage();
