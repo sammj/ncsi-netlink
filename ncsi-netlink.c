@@ -11,10 +11,22 @@
 #include <linux/ncsi.h>
 //#include "ncsi.h"
 
+struct ncsi_pkt_hdr {
+	unsigned char mc_id;        /* Management controller ID */
+	unsigned char revision;     /* NCSI version - 0x01      */
+	unsigned char reserved;     /* Reserved                 */
+	unsigned char id;           /* Packet sequence number   */
+	unsigned char type;         /* Packet type              */
+	unsigned char channel;      /* Network controller ID    */
+	__be16        length;       /* Payload length           */
+	__be32        reserved1[2]; /* Reserved                 */
+};
+
 struct ncsi_msg {
 	struct nl_sock	*sk;
 	struct nl_msg	*msg;
 	struct nlmsghdr	*hdr;
+	int ret;
 };
 
 static void free_ncsi_msg(struct ncsi_msg *msg)
@@ -69,6 +81,7 @@ int setup_ncsi_message(struct ncsi_msg *msg, int cmd, int flags)
 		rc = -1;
 		goto out;
 	}
+	msg->ret = 1;
 
 	return 0;
 out:
@@ -308,10 +321,132 @@ out:
 	return rc;
 }
 
+static int send_cb(struct nl_msg *msg, void *arg)
+{
+#define ETHERNET_HEADER_SIZE 16
+
+	struct nlmsghdr *hdr = nlmsg_hdr(msg);
+	struct nlattr *tb[NCSI_ATTR_MAX + 1] = {0};
+	int rc, data_len, i;
+	char *data;
+	int *ret = arg;
+
+	static struct nla_policy ncsi_genl_policy[NCSI_ATTR_MAX + 1] = {
+		[NCSI_ATTR_IFINDEX] =		{ .type = NLA_U32 },
+		[NCSI_ATTR_PACKAGE_LIST] =	{ .type = NLA_NESTED },
+		[NCSI_ATTR_PACKAGE_ID] =	{ .type = NLA_U32 },
+		[NCSI_ATTR_CHANNEL_ID] =	{ .type = NLA_U32 },
+		[NCSI_ATTR_DATA] =		{ .type = NLA_BINARY  },
+		[NCSI_ATTR_MULTI_FLAG] =	{ .type = NLA_FLAG },
+		[NCSI_ATTR_PACKAGE_MASK] =	{ .type = NLA_U32 },
+		[NCSI_ATTR_CHANNEL_MASK] =	{ .type = NLA_U32 },
+	};
+
+
+	rc = genlmsg_parse(hdr, 0, tb, NCSI_ATTR_MAX, ncsi_genl_policy);
+	if (rc) {
+		fprintf(stderr, "Failed to parse ncsi cmd callback\n");
+		return rc;
+	}
+
+	data_len = nla_len(tb[NCSI_ATTR_DATA]) - ETHERNET_HEADER_SIZE;
+	data = nla_data(tb[NCSI_ATTR_DATA]) + ETHERNET_HEADER_SIZE;
+
+
+	printf("NC-SI Response Payload length = %d\n", data_len);
+	printf("Response Payload:\n");
+	for (i = 0; i < data_len; ++i) {
+		if (i && !(i%4))
+			printf("\n%d: ", 16+i);
+		printf("0x%02x ", *(data+i));
+	}
+	printf("\n");
+
+	// indicating call back has been completed
+	*ret = 0;
+	return 0;
+}
+
+static int run_command_send(int ifindex, int package, int channel,
+			uint8_t type, short payload_len, uint8_t *payload)
+{
+	struct ncsi_msg msg;
+	struct ncsi_pkt_hdr *hdr;
+	int rc;
+	uint8_t *pData, *pCtrlPktPayload;
+
+	// allocate a  contiguous buffer space to hold ncsi message
+	//  (header + Control Packet payload)
+	pData = calloc(1, sizeof(struct ncsi_pkt_hdr) + payload_len);
+	if (!pData) {
+		fprintf(stderr, "Failed to allocate buffer for ctrl pkt, %m\n");
+		goto out;
+	}
+	// prepare buffer to be copied to netlink msg
+	hdr = (void *)pData;
+	pCtrlPktPayload = pData + sizeof(struct ncsi_pkt_hdr);
+	memcpy(pCtrlPktPayload, payload, payload_len);
+
+	rc = setup_ncsi_message(&msg, NCSI_CMD_SEND_CMD, 0);
+	if (rc)
+		return -1;
+
+	printf("send cmd, ifindex %d, package %d, channel %d, type 0x%x\n",
+			ifindex, package, channel, type);
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_IFINDEX, ifindex);
+	if (rc) {
+		fprintf(stderr, "Failed to add ifindex, %m\n");
+		goto out;
+	}
+
+	if (package >= 0) {
+		rc = nla_put_u32(msg.msg, NCSI_ATTR_PACKAGE_ID, package);
+		if (rc) {
+			fprintf(stderr, "Failed to add package id, %m\n");
+			goto out;
+		}
+	}
+
+	rc = nla_put_u32(msg.msg, NCSI_ATTR_CHANNEL_ID, channel);
+	if (rc)
+		fprintf(stderr, "Failed to add channel, %m\n");
+
+	hdr->type = type;   // NC-SI command
+	hdr->length = htons(payload_len);  // NC-SI command payload length
+	rc = nla_put(msg.msg, NCSI_ATTR_DATA,
+				sizeof(struct ncsi_pkt_hdr)+payload_len,
+				(void *)pData);
+	if (rc)
+		fprintf(stderr, "Failed to add netlink header, %m\n");
+
+	nl_socket_disable_seq_check(msg.sk);
+	rc = nl_socket_modify_cb(msg.sk, NL_CB_VALID, NL_CB_CUSTOM, send_cb,
+			&(msg.ret));
+
+	rc = nl_send_auto(msg.sk, msg.msg);
+	if (rc < 0) {
+		fprintf(stderr, "Failed to send message, %m\n");
+		goto out;
+	}
+
+	while (msg.ret == 1) {
+		rc = nl_recvmsgs_default(msg.sk);
+		if (rc) {
+			fprintf(stderr, "Failed to rcv msg, rc=%d %m\n", rc);
+			goto out;
+		}
+	}
+
+out:
+	free_ncsi_msg(&msg);
+	return rc;
+}
+
 void usage(void)
 {
 	printf(	"ncsi-netlink: Send messages to the NCSI driver via Netlink\n"
-		"ncsi-netlink [-h] operation [-p PACKAGE] [-c CHANNEL] [-l IFINDEX]\n"
+		"ncsi-netlink [-h] operation [-p PACKAGE] [-c CHANNEL] [-l IFINDEX] [-o cmd [payload]]\n"
 		"\t--ifindex index      Specify the interface index\n"
 		"\t--package package    Package number\n"
 		"\t--channel channel    Channel number (aka. port number)\n"
@@ -326,7 +461,9 @@ void usage(void)
 int main(int argc, char *argv[])
 {
 	int rc, operation = -1;
-	int package, channel, ifindex;
+	int package, channel, ifindex, opcode;
+	uint8_t payload[2048] = {0};
+	short payload_length = 0, i = 0;
 
 	static const struct option long_opts[] = {
 		{"channel",	required_argument, 	NULL, 'c'},
@@ -336,12 +473,12 @@ int main(int argc, char *argv[])
 		{"package",	required_argument, 	NULL, 'p'},
 		{"set",		no_argument, 		NULL, 's'},
 		{"clear",	no_argument, 		NULL, 'x'},
+		{"cmd",		required_argument,	NULL, 'o'},
 		{ NULL, 0, NULL, 0},
 	};
-	static const char short_opts[] = "c:hil:p:sx";
+	static const char short_opts[] = "c:hil:p:sxo:";
 
-	package = channel = ifindex = -1;
-
+	package = channel = ifindex = opcode = -1;
 	while (true) {
 		int c = getopt_long(argc, argv, short_opts, long_opts, NULL);
 
@@ -350,6 +487,17 @@ int main(int argc, char *argv[])
 
 		errno = 0;
 		switch (c) {
+		case 'o':
+			opcode = strtoul(optarg, NULL, 0);
+			if (errno) {
+				fprintf(stderr, "Couldn't parse opcode, %m\n");
+				return -1;
+			}
+			operation = NCSI_CMD_SEND_CMD;
+			payload_length = argc - optind;
+			for (i = 0; i < payload_length; ++i)
+				payload[i] = (int)strtoul(argv[i + optind], NULL, 0);
+			break;
 		case 'c':
 			channel = strtoul(optarg, NULL, 0);
 			if (errno) {
@@ -407,6 +555,10 @@ int main(int argc, char *argv[])
 		break;
 	case NCSI_CMD_CLEAR_INTERFACE:
 		rc = run_command_clear(ifindex);
+		break;
+	case NCSI_CMD_SEND_CMD:
+		rc = run_command_send(ifindex, package, channel,
+			opcode, payload_length, payload);
 		break;
 	default:
 		usage();
