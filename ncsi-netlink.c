@@ -11,6 +11,51 @@
 #include <linux/ncsi.h>
 //#include "ncsi.h"
 
+#define BIT(_x) (1UL << (_x))
+
+#define LINK_SPEED_10BASE_T_HALF_DUPLEX  	(1 << 1)
+#define LINK_SPEED_10BASE_T_FULL_DUPLEX 	(2 << 1)
+#define LINK_SPEED_100BASE_TX_HALF_DUPLEX 	(3 << 1)
+#define LINK_SPEED_100BASE_T4 			(4 << 1)
+#define LINK_SPEED_100BASE_TX_FULL_DUPLEX 	(5 << 1)
+#define LINK_SPEED_1000BASE_T_HALF_DUPLEX 	(6 << 1)
+#define LINK_SPEED_1000BASE_T_FULL_DUPLEX 	(7 << 1)
+#define LINK_SPEED_10GBASE_T		 	(8 << 1)
+
+const char* link_speeds[15] = {
+	"10BASE-T half-duplex",
+	"10BASE-T full-duplex",
+	"100BASE-TX half-duplex",
+	"100BASE-T4",
+	"100BASE-TX full-duplex",
+	"1000BASE-T half-duplex",
+	"1000BASE-T full-duplex",
+	"10G-BASE-T support",
+	"speed unknown (0x9)",
+	"speed unknown (0xa)",
+	"speed unknown (0xb)",
+	"speed unknown (0xc)",
+	"speed unknown (0xd)",
+	"speed unknown (0xe)",
+	"speed unknown (0xf)"
+};
+
+static void ncsi_show_link_state(unsigned int status)
+{
+	printf("\t\t  Link %s ", status & BIT(0) ? "up" : "down");
+
+	printf("%s\n", link_speeds[(status >> 1) & 0xf]);
+
+	printf("\t\t  Auto negoiation %s\n", status & BIT(5) ? "enabled" : "disabled");
+	printf("\t\t  Auto negoiation %s\n", status & BIT(6) ? "complete" : "not complete");
+	printf("\t\t  Parallel detection %s\n", status & BIT(7) ? "used" : "not used");
+
+	printf("\t\t  TX flow control %s\n", status & BIT(16) ? "enabled" : "disabled");
+	printf("\t\t  RX flow control %s\n", status & BIT(17) ? "enabled" : "disabled");
+	printf("\t\t  SerDes Link %s\n", status & BIT(20) ? "used" : "not used");
+	printf("\t\t  OEM link speed %s\n", status & BIT(21) ? "valid" : "invalid");
+}
+
 struct ncsi_pkt_hdr {
 	unsigned char mc_id;        /* Management controller ID */
 	unsigned char revision;     /* NCSI version - 0x01      */
@@ -175,6 +220,7 @@ static int info_cb(struct nl_msg *msg,
 					nla_get_string(ctb[NCSI_CHANNEL_ATTR_VERSION_STR]));
 			printf("\t\tlink state 0x%.08x\n",
 					nla_get_u32(ctb[NCSI_CHANNEL_ATTR_LINK_STATE]));
+			ncsi_show_link_state(nla_get_u32(ctb[NCSI_CHANNEL_ATTR_LINK_STATE]));
 			printf("\t\tchannel is %sactive\n",
 					ctb[NCSI_CHANNEL_ATTR_ACTIVE] ? "" : "in");
 			if (ctb[NCSI_CHANNEL_ATTR_FORCED])
